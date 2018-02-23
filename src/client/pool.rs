@@ -1,18 +1,14 @@
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io;
-use std::ops::{Deref, DerefMut, BitAndAssign};
-use std::rc::{Rc, Weak};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use futures::{Future, Async, Poll};
-use relay;
-
-use proto::{KeepAlive, KA};
+use futures::sync::oneshot;
 
 pub struct Pool<T> {
-    inner: Rc<RefCell<PoolInner<T>>>,
+    inner: Arc<Mutex<PoolInner<T>>>,
 }
 
 // Before using a pooled connection, make sure the sender is not dead.
@@ -28,7 +24,7 @@ struct PoolInner<T> {
     enabled: bool,
     // These are internal Conns sitting in the event loop in the KeepAlive
     // state, waiting to receive a new Request to send on the socket.
-    idle: HashMap<Rc<String>, Vec<Entry<T>>>,
+    idle: HashMap<Arc<String>, Vec<Idle<T>>>,
     // These are outstanding Checkouts that are waiting for a socket to be
     // able to send a Request one. This is used when "racing" for a new
     // connection.
@@ -38,14 +34,14 @@ struct PoolInner<T> {
     // this list is checked for any parked Checkouts, and tries to notify
     // them that the Conn could be used instead of waiting for a brand new
     // connection.
-    parked: HashMap<Rc<String>, VecDeque<relay::Sender<Entry<T>>>>,
+    parked: HashMap<Arc<String>, VecDeque<oneshot::Sender<T>>>,
     timeout: Option<Duration>,
 }
 
-impl<T: Clone + Ready> Pool<T> {
+impl<T> Pool<T> {
     pub fn new(enabled: bool, timeout: Option<Duration>) -> Pool<T> {
         Pool {
-            inner: Rc::new(RefCell::new(PoolInner {
+            inner: Arc::new(Mutex::new(PoolInner {
                 enabled: enabled,
                 idle: HashMap::new(),
                 parked: HashMap::new(),
@@ -53,37 +49,37 @@ impl<T: Clone + Ready> Pool<T> {
             })),
         }
     }
+}
 
+impl<T: Ready> Pool<T> {
     pub fn checkout(&self, key: &str) -> Checkout<T> {
         Checkout {
-            key: Rc::new(key.to_owned()),
+            key: Arc::new(key.to_owned()),
             pool: self.clone(),
             parked: None,
         }
     }
 
-    fn put(&mut self, key: Rc<String>, entry: Entry<T>) {
+    fn put(&mut self, key: Arc<String>, value: T) {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.enabled {
+            return;
+        }
         trace!("Pool::put {:?}", key);
-        let mut inner = self.inner.borrow_mut();
         let mut remove_parked = false;
-        let mut entry = Some(entry);
+        let mut value = Some(value);
         if let Some(parked) = inner.parked.get_mut(&key) {
             while let Some(tx) = parked.pop_front() {
-                if tx.is_canceled() {
-                    trace!("Pool::put removing canceled parked {:?}", key);
-                } else {
-                    tx.complete(entry.take().unwrap());
-                    break;
-                }
-                /*
-                match tx.send(entry.take().unwrap()) {
-                    Ok(()) => break,
-                    Err(e) => {
-                        trace!("Pool::put removing canceled parked {:?}", key);
-                        entry = Some(e);
+                if !tx.is_canceled() {
+                    match tx.send(value.take().unwrap()) {
+                        Ok(()) => break,
+                        Err(e) => {
+                            value = Some(e);
+                        }
                     }
                 }
-                */
+
+                trace!("Pool::put removing canceled parked {:?}", key);
             }
             remove_parked = parked.is_empty();
         }
@@ -91,36 +87,36 @@ impl<T: Clone + Ready> Pool<T> {
             inner.parked.remove(&key);
         }
 
-        match entry {
-            Some(entry) => {
+        match value {
+            Some(value) => {
                 debug!("pooling idle connection for {:?}", key);
                 inner.idle.entry(key)
                      .or_insert(Vec::new())
-                     .push(entry);
+                     .push(Idle {
+                         value: value,
+                         idle_at: Instant::now(),
+                     });
             }
             None => trace!("Pool::put found parked {:?}", key),
         }
     }
 
-    fn take(&self, key: &Rc<String>) -> Option<Pooled<T>> {
+    fn take(&self, key: &Arc<String>) -> Option<Pooled<T>> {
         let entry = {
-            let mut inner = self.inner.borrow_mut();
+            let mut inner = self.inner.lock().unwrap();
             let expiration = Expiration::new(inner.timeout);
             let mut should_remove = false;
             let entry = inner.idle.get_mut(key).and_then(|list| {
                 trace!("take; url = {:?}, expiration = {:?}", key, expiration.0);
                 while let Some(mut entry) = list.pop() {
-                    match entry.status.get() {
-                        TimedKA::Idle(idle_at) if !expiration.expires(idle_at) => {
-                            if let Ok(Async::Ready(())) = entry.value.poll_ready() {
-                                should_remove = list.is_empty();
-                                return Some(entry);
-                            }
-                        },
-                        _ => {},
+                    if !expiration.expires(entry.idle_at) {
+                        if let Ok(Async::Ready(())) = entry.value.poll_ready() {
+                            should_remove = list.is_empty();
+                            return Some(entry);
+                        }
                     }
                     trace!("removing unacceptable pooled {:?}", key);
-                    // every other case the Entry should just be dropped
+                    // every other case the Idle should just be dropped
                     // 1. Idle but expired
                     // 2. Busy (something else somehow took it?)
                     // 3. Disabled don't reuse of course
@@ -135,40 +131,32 @@ impl<T: Clone + Ready> Pool<T> {
             entry
         };
 
-        entry.map(|e| self.reuse(key, e))
+        entry.map(|e| self.reuse(key, e.value))
     }
 
 
-    pub fn pooled(&self, key: Rc<String>, value: T) -> Pooled<T> {
+    pub fn pooled(&self, key: Arc<String>, value: T) -> Pooled<T> {
         Pooled {
-            entry: Entry {
-                value: value,
-                is_reused: false,
-                status: Rc::new(Cell::new(TimedKA::Busy)),
-            },
+            is_reused: false,
             key: key,
-            pool: Rc::downgrade(&self.inner),
+            pool: Arc::downgrade(&self.inner),
+            value: Some(value)
         }
     }
 
-    fn is_enabled(&self) -> bool {
-        self.inner.borrow().enabled
-    }
-
-    fn reuse(&self, key: &Rc<String>, mut entry: Entry<T>) -> Pooled<T> {
+    fn reuse(&self, key: &Arc<String>, value: T) -> Pooled<T> {
         debug!("reuse idle connection for {:?}", key);
-        entry.is_reused = true;
-        entry.status.set(TimedKA::Busy);
         Pooled {
-            entry: entry,
+            is_reused: true,
             key: key.clone(),
-            pool: Rc::downgrade(&self.inner),
+            pool: Arc::downgrade(&self.inner),
+            value: Some(value),
         }
     }
 
-    fn park(&mut self, key: Rc<String>, tx: relay::Sender<Entry<T>>) {
+    fn park(&mut self, key: Arc<String>, tx: oneshot::Sender<T>) {
         trace!("park; waiting for idle connection: {:?}", key);
-        self.inner.borrow_mut()
+        self.inner.lock().unwrap()
             .parked.entry(key)
             .or_insert(VecDeque::new())
             .push_back(tx);
@@ -180,8 +168,8 @@ impl<T> Pool<T> {
     /// and possibly inserted into the pool that it is waiting for an idle
     /// connection. If a user ever dropped that future, we need to clean out
     /// those parked senders.
-    fn clean_parked(&mut self, key: &Rc<String>) {
-        let mut inner = self.inner.borrow_mut();
+    fn clean_parked(&mut self, key: &Arc<String>) {
+        let mut inner = self.inner.lock().unwrap();
 
         let mut remove_parked = false;
         if let Some(parked) = inner.parked.get_mut(key) {
@@ -204,121 +192,85 @@ impl<T> Clone for Pool<T> {
     }
 }
 
-#[derive(Clone)]
-pub struct Pooled<T> {
-    entry: Entry<T>,
-    key: Rc<String>,
-    pool: Weak<RefCell<PoolInner<T>>>,
+pub struct Pooled<T: Ready> {
+    value: Option<T>,
+    is_reused: bool,
+    key: Arc<String>,
+    pool: Weak<Mutex<PoolInner<T>>>,
 }
 
-impl<T> Pooled<T> {
+impl<T: Ready> Pooled<T> {
     pub fn is_reused(&self) -> bool {
-        self.entry.is_reused
+        self.is_reused
+    }
+
+    fn as_ref(&self) -> &T {
+        self.value.as_ref().expect("not dropped")
+    }
+
+    fn as_mut(&mut self) -> &mut T {
+        self.value.as_mut().expect("not dropped")
     }
 }
 
-impl<T> Deref for Pooled<T> {
+impl<T: Ready> Deref for Pooled<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.entry.value
+        self.as_ref()
     }
 }
 
-impl<T> DerefMut for Pooled<T> {
+impl<T: Ready> DerefMut for Pooled<T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.entry.value
+        self.as_mut()
     }
 }
 
-impl<T: Clone + Ready> KeepAlive for Pooled<T> {
-    fn busy(&mut self) {
-        self.entry.status.set(TimedKA::Busy);
-    }
+impl<T: Ready> Drop for Pooled<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            if let Some(inner) = self.pool.upgrade() {
+                let mut pool = Pool {
+                    inner: inner,
+                };
 
-    fn disable(&mut self) {
-        self.entry.status.set(TimedKA::Disabled);
-    }
-
-    fn idle(&mut self) {
-        let previous = self.status();
-        self.entry.status.set(TimedKA::Idle(Instant::now()));
-        if let KA::Idle = previous {
-            trace!("Pooled::idle already idle");
-            return;
-        }
-        self.entry.is_reused = true;
-        if let Some(inner) = self.pool.upgrade() {
-            let mut pool = Pool {
-                inner: inner,
-            };
-            if pool.is_enabled() {
-                pool.put(self.key.clone(), self.entry.clone());
+                pool.put(self.key.clone(), value);
             } else {
-                trace!("keepalive disabled, dropping pooled ({:?})", self.key);
-                self.disable();
+                trace!("pool dropped, dropping pooled ({:?})", self.key);
             }
-        } else {
-            trace!("pool dropped, dropping pooled ({:?})", self.key);
-            self.disable();
-        }
-    }
-
-    fn status(&self) -> KA {
-        match self.entry.status.get() {
-            TimedKA::Idle(_) => KA::Idle,
-            TimedKA::Busy => KA::Busy,
-            TimedKA::Disabled => KA::Disabled,
         }
     }
 }
 
-impl<T> fmt::Debug for Pooled<T> {
+impl<T: Ready> fmt::Debug for Pooled<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Pooled")
-            .field("status", &self.entry.status.get())
             .field("key", &self.key)
             .finish()
     }
 }
 
-impl<T: Clone + Ready> BitAndAssign<bool> for Pooled<T> {
-    fn bitand_assign(&mut self, enabled: bool) {
-        if !enabled {
-            self.disable();
-        }
-    }
-}
-
-#[derive(Clone)]
-struct Entry<T> {
+struct Idle<T> {
+    idle_at: Instant,
     value: T,
-    is_reused: bool,
-    status: Rc<Cell<TimedKA>>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum TimedKA {
-    Idle(Instant),
-    Busy,
-    Disabled,
 }
 
 pub struct Checkout<T> {
-    key: Rc<String>,
+    key: Arc<String>,
     pool: Pool<T>,
-    parked: Option<relay::Receiver<Entry<T>>>,
+    parked: Option<oneshot::Receiver<T>>,
 }
 
 struct NotParked;
 
-impl<T: Clone + Ready> Checkout<T> {
+impl<T: Ready> Checkout<T> {
     fn poll_parked(&mut self) -> Poll<Pooled<T>, NotParked> {
         let mut drop_parked = false;
         if let Some(ref mut rx) = self.parked {
             match rx.poll() {
-                Ok(Async::Ready(mut entry)) => {
-                    if let Ok(Async::Ready(())) = entry.value.poll_ready() {
-                        return Ok(Async::Ready(self.pool.reuse(&self.key, entry)));
+                Ok(Async::Ready(mut value)) => {
+                    if let Ok(Async::Ready(())) = value.poll_ready() {
+                        return Ok(Async::Ready(self.pool.reuse(&self.key, value)));
                     }
                     drop_parked = true;
                 },
@@ -334,7 +286,7 @@ impl<T: Clone + Ready> Checkout<T> {
 
     fn park(&mut self) {
         if self.parked.is_none() {
-            let (tx, mut rx) = relay::channel();
+            let (tx, mut rx) = oneshot::channel();
             let _ = rx.poll(); // park this task
             self.pool.park(self.key.clone(), tx);
             self.parked = Some(rx);
@@ -342,9 +294,9 @@ impl<T: Clone + Ready> Checkout<T> {
     }
 }
 
-impl<T: Clone + Ready> Future for Checkout<T> {
+impl<T: Ready> Future for Checkout<T> {
     type Item = Pooled<T>;
-    type Error = io::Error;
+    type Error = ::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         match self.poll_parked() {
@@ -386,6 +338,7 @@ impl Expiration {
 }
 
 
+/*
 #[cfg(test)]
 mod tests {
     use std::rc::Rc;
@@ -496,3 +449,4 @@ mod tests {
         }).wait().unwrap();
     }
 }
+*/
